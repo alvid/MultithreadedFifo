@@ -4,10 +4,12 @@
 
 #pragma once
 
+#include <iostream>
+#include <sstream>
 #include <mutex>
 #include <thread>
 #include <array>
-#include <iostream>
+#include <chrono>
 
 // Защищенная в плане многопоточного доступа очередь типа FIFO с предварительным резервированием.
 // Организована по типу кольцевого буфера.
@@ -19,6 +21,7 @@ public:
         eGood = 0,
         eInterrupted
     };
+
     Fifo() : ix_read(0), ix_write(0), cur_size(0)
     {
     }
@@ -30,6 +33,7 @@ public:
         stopped_flag = true;
         cv_free.notify_all();
         cv.notify_all();
+
         std::this_thread::yield();
 
         std::unique_lock lock(mt);
@@ -42,12 +46,14 @@ public:
     }
 
     // Положить задачу в хвост очереди. Если очередь заполнена, поток будет заблокирован до появления свободного места.
-    // Ожидающий поток может быть разблокирован по внешнему сигналу, в этом случае задача не кладется в очередь и
-    // возвращается код eInterrupted.
+    // Ожидающий поток может быть разблокирован по внешнему сигналу прерывания работы, в этом случае задача не кладется
+    // в очередь и возвращается код eInterrupted.
     Ret_code push_back(Task const& request)
     {
         std::unique_lock lock(mt);
 
+        bool wait = cur_size == queue.max_size();
+        auto ts = std::chrono::steady_clock::now();
         while(cur_size == queue.max_size()) {
             lock.unlock();
             {
@@ -57,6 +63,11 @@ public:
                     return eInterrupted;
             }
             lock.lock();
+        }
+        if(wait) {
+            auto te = std::chrono::steady_clock::now();
+            auto dt = std::chrono::duration_cast<std::chrono::microseconds>(te - ts);
+            wait_for_free_space_us += dt;
         }
 
         if(stopped_flag)
@@ -68,10 +79,13 @@ public:
             ix_write = 0;
         ++cur_size;
 
+        ++push_tasks;
+
         if(cur_size == 1) {
             std::cout << "NOTIFY";
             cv.notify_one();
         }
+
         return eGood;
     }
 
@@ -82,16 +96,25 @@ public:
     {
         std::unique_lock lock(mt);
 
+        bool wait = cur_size == 0;
+        auto ts = std::chrono::steady_clock::now();
         while(cur_size == 0) {
             cv.wait(lock, [&] { return cur_size || stopped_flag; });
             if(stopped_flag)
                 return eInterrupted;
+        }
+        if(wait) {
+            auto te = std::chrono::steady_clock::now();
+            auto dt = std::chrono::duration_cast<std::chrono::microseconds>(te - ts);
+            wait_for_task_us += dt;
         }
 
         if(stopped_flag)
             return eInterrupted;
 
         std::cout << "POP" << ix_read;
+
+        ++pop_tasks;
 
         result = queue[ix_read];
         if(++ix_read == queue.max_size())
@@ -100,6 +123,13 @@ public:
             cv_free.notify_one();
         return eGood;
     }
+
+public:
+    inline static thread_local std::chrono::microseconds wait_for_free_space_us{0};
+    inline static thread_local uint64_t push_tasks{0};
+
+    inline static thread_local std::chrono::microseconds wait_for_task_us{0};
+    inline static thread_local uint64_t pop_tasks{0};
 
 private:
     std::atomic_bool stopped_flag;
@@ -115,5 +145,4 @@ private:
     size_t ix_write;
     size_t cur_size;
 };
-
 
